@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import copy
 import pdfplumber
 import logging
@@ -16,398 +15,32 @@ import subprocess
 import sys
 from datetime import datetime
 
+from coa_formats import DEFAULT_BRAND_MAP, DEFAULT_CLIENT_MAP
+from coa_template_match import score_template_candidate
+
+from coa_storage import (
+    CONFIG_FILE,
+    COA_REGISTRY,
+    MICRO_HISTORY,
+    SESSION_FILE,
+    get_registro_path as _storage_get_registro_path,
+    load_config,
+    load_micro_history,
+    load_session_data,
+    normalize_product_name,
+    registrar_coa as _storage_registrar_coa,
+    save_config,
+    save_micro_history_record as _storage_save_micro_history_record,
+    save_session_data,
+)
+
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-CONFIG_FILE   = "config.json"
-MICRO_HISTORY = "Historial_Microbiologia.xlsx"
-COA_REGISTRY  = "Registro_COAs.xlsx"
-SESSION_FILE  = "session.json"
-APP_VERSION   = "2.6"
+APP_VERSION = "2.6"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DEFAULT_MICRO_FORMATS = {
-    "Estándar": {
-        "tipo": "simple",
-        "descripcion": "Formato estándar genérico",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram,tpc"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-        ]
-    },
-    "Inabata / Korea": {
-        "tipo": "simple",
-        "descripcion": "Inabata y clientes coreanos",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "Negative", "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-        ]
-    },
-    "Livemore": {
-        "tipo": "simple",
-        "descripcion": "Livemore / Berry Blend",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Absence",  "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Absence",  "ingresar": False, "sinonimos": "listeria"},
-            {"nombre": "STEC",                          "clave": "STEC",         "defecto": "Absence",  "ingresar": False, "sinonimos": "stec"},
-            {"nombre": "Hepatitis A",                   "clave": "HepA",         "defecto": "Absence",  "ingresar": False, "sinonimos": "hepatitis a,hepatitis"},
-            {"nombre": "Norovirus GI",                  "clave": "NorovirusGI",  "defecto": "Absence",  "ingresar": False, "sinonimos": "norovirus gi"},
-            {"nombre": "Norovirus GII",                 "clave": "NorovirusGII", "defecto": "Absence",  "ingresar": False, "sinonimos": "norovirus gii"},
-        ]
-    },
-    "Trader Joe's": {
-        "tipo": "simple",
-        "descripcion": "Trader Joe's / Core Fruit",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-            {"nombre": "E. Coli O157",                  "clave": "EcoliO157",    "defecto": "Negative", "ingresar": False, "sinonimos": "e. coli o157,ecoli o157"},
-        ]
-    },
-    "VLM Kit Estándar": {
-        "tipo": "simple",
-        "descripcion": "VLM James Farm, Lidl, Kit estándar",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-            {"nombre": "Hepatitis A",                   "clave": "HepA",         "defecto": "Negative", "ingresar": False, "sinonimos": "hepatitis a,hepatitis"},
-            {"nombre": "Norovirus",                     "clave": "Norovirus",    "defecto": "Negative", "ingresar": False, "sinonimos": "norovirus"},
-        ]
-    },
-    "Woodland Partners": {
-        "tipo": "simple",
-        "descripcion": "Woodland Partners convencional y orgánico",
-        "parametros": [
-            {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Staphylococcus aureus",         "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                  "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-        ]
-    },
-    "Woolworths / Macro": {
-        "tipo": "simple",
-        "descripcion": "Woolworths y Macro",
-        "parametros": [
-            {"nombre": "Total Plate Count",                    "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",                      "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                              "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast",                                "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
-            {"nombre": "Mold",                                 "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
-            {"nombre": "Coagulase-positive staphylococci",     "clave": "Staph",        "defecto": "<10",      "ingresar": False, "sinonimos": "coagulase-positive staphylococci,staphylococcus,coagulase"},
-            {"nombre": "Salmonella sp.",                       "clave": "Salmonella",   "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria sp.",                         "clave": "Listeria",     "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-            {"nombre": "Hepatitis A",                          "clave": "HepA",         "defecto": "Negative", "ingresar": False, "sinonimos": "hepatitis a,hepatitis"},
-            {"nombre": "Norovirus GI",                         "clave": "NorovirusGI",  "defecto": "Absence",  "ingresar": False, "sinonimos": "norovirus gi"},
-            {"nombre": "Norovirus GII",                        "clave": "NorovirusGII", "defecto": "Absence",  "ingresar": False, "sinonimos": "norovirus gii"},
-        ]
-    },
-    "Camerican": {
-        "tipo": "camerican",
-        "descripcion": "Camerican — tabla por lote con Lot: en encabezado",
-        "parametros": [
-            {"nombre": "Total Plate Count (T.V.C.)", "clave": "TPC",        "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram,t.v.c."},
-            {"nombre": "Total Coliforms",            "clave": "Coliforms",  "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",                    "clave": "Ecoli",      "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Yeast and mold",             "clave": "YeastMold",  "defecto": "",         "ingresar": True,  "sinonimos": "yeast and mold,yeast & mold"},
-            {"nombre": "Staphylococcus aureus",      "clave": "Staph",      "defecto": "<10",      "ingresar": False, "sinonimos": "staphylococcus,coagulase"},
-            {"nombre": "Salmonella",                 "clave": "Salmonella", "defecto": "Negative", "ingresar": False, "sinonimos": "salmonella"},
-            {"nombre": "Listeria Monocytogenes",     "clave": "Listeria",   "defecto": "Negative", "ingresar": False, "sinonimos": "listeria"},
-        ]
-    },
-    "VLM Great Value": {
-        "tipo": "n_series",
-        "descripcion": "VLM Great Value — n1 a n5 por parámetro por lote",
-        "parametros": [
-            {"nombre": "Total Plate Count", "clave": "TPC",      "defecto": "",    "ingresar": True,  "n_series": True,  "sinonimos": "total plate count,total plate,ram"},
-            {"nombre": "Total Coliforms",   "clave": "Coliforms","defecto": "<10", "ingresar": False, "n_series": True,  "sinonimos": "total coliforms,coliforms"},
-            {"nombre": "E. coli",           "clave": "Ecoli",    "defecto": "<10", "ingresar": False, "n_series": True,  "sinonimos": "e. coli,e.coli"},
-            {"nombre": "Moulds",            "clave": "Mold",     "defecto": "",    "ingresar": True,  "n_series": True,  "sinonimos": "moulds,mold"},
-            {"nombre": "Yeasts",            "clave": "Yeast",    "defecto": "",    "ingresar": True,  "n_series": True,  "sinonimos": "yeasts,yeast"},
-            {"nombre": "Listeria Monocytogenes", "clave": "Listeria",  "defecto": "None detected", "ingresar": False, "n_series": False, "sinonimos": "listeria"},
-            {"nombre": "Salmonella",             "clave": "Salmonella","defecto": "None detected", "ingresar": False, "n_series": False, "sinonimos": "salmonella"},
-        ]
-    },
-}
-
-DEFAULT_QUALITY_FORMATS = {
-    "Mixes / Berries": {
-        "descripcion": "Mix de frutas y berries en general",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                    "defecto": "0.00"},
-            {"nombre": "Decay",                   "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": ""},
-            {"nombre": "Color variation",          "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Splits / Crumble",         "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Mora": {
-        "descripcion": "Mora (Blackberry)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                    "defecto": "0.00"},
-            {"nombre": "Decay",                   "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": ""},
-            {"nombre": "Color variation",          "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Splits",                   "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Arándano": {
-        "descripcion": "Arándano (Blueberry)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Decay",                   "defecto": "0.00"},
-            {"nombre": "Insect, mould, sun damage","defecto": "0.00"},
-            {"nombre": "Russet",                   "defecto": ""},
-            {"nombre": "Dehydration",              "defecto": ""},
-            {"nombre": "Color Variation",          "defecto": ""},
-            {"nombre": "Overmatured / crushed",    "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-            {"nombre": "Foreign Matter",           "defecto": "0.00"},
-        ]
-    },
-    "Cereza": {
-        "descripcion": "Cereza (Cherry)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Color Variation",          "defecto": ""},
-            {"nombre": "Pits",                     "defecto": "0.00"},
-            {"nombre": "Stem / Stalks",            "defecto": "0.00"},
-            {"nombre": "Mould, sun damage",        "defecto": ""},
-            {"nombre": "Insect damage",            "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": "0.00"},
-            {"nombre": "Broken / Crumble",         "defecto": ""},
-            {"nombre": "Blocked",                  "defecto": "0.00"},
-            {"nombre": "Foreign Material",         "defecto": "0.00"},
-            {"nombre": "Vegetable Material",       "defecto": "0.50"},
-        ]
-    },
-    "Frutilla": {
-        "descripcion": "Frutilla (Strawberry)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Color Variation",          "defecto": ""},
-            {"nombre": "Stem / Stalks",            "defecto": ""},
-            {"nombre": "Mould, sun damage",        "defecto": ""},
-            {"nombre": "Insect damage",            "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": "0.00"},
-            {"nombre": "Broken / Crumble",         "defecto": ""},
-            {"nombre": "Blocked",                  "defecto": "0.00"},
-            {"nombre": "Foreign Material",         "defecto": "0.00"},
-            {"nombre": "Vegetable Material",       "defecto": "0.50"},
-        ]
-    },
-    "Frambuesa / Crumble": {
-        "descripcion": "Frambuesa y crumble (3 columnas: Limit + Results)",
-        "columnas": 3,
-        "parametros": [
-            {"nombre": "Stem",                    "limit": "1 unit",    "defecto": ""},
-            {"nombre": "Foreign Vegetable Matter", "limit": "4 units",   "defecto": ""},
-            {"nombre": "Foreign Matter",           "limit": "None",      "defecto": "None"},
-            {"nombre": "Insect Count",             "limit": "2 per box", "defecto": ""},
-            {"nombre": "Larvae Count",             "limit": "8 per kg",  "defecto": ""},
-            {"nombre": "Whole and broken fruit",   "limit": "<10%",      "defecto": ""},
-        ]
-    },
-    "Frambuesa": {
-        "descripcion": "Frambuesa (2 columnas)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                     "defecto": "0.00"},
-            {"nombre": "Decay",                    "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": "0.00"},
-            {"nombre": "Color variation",          "defecto": "0.00"},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Splits / Crumble",         "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Arilos": {
-        "descripcion": "Arilos (granada)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Mold, Sun Damage",         "defecto": "0.00"},
-            {"nombre": "Vegetal matter from fruits","defecto": "0.00"},
-        ]
-    },
-    "Palta": {
-        "descripcion": "Palta (Avocado)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Color Variation",          "defecto": "0.00"},
-            {"nombre": "Stem",                     "defecto": "0.00"},
-            {"nombre": "Pits",                     "defecto": ""},
-            {"nombre": "Mould, sun damage",        "defecto": "0.00"},
-            {"nombre": "Overmatured and crushed",  "defecto": ""},
-            {"nombre": "Broken and small pieces",  "defecto": ""},
-            {"nombre": "Foreign Material",         "defecto": "0.00"},
-            {"nombre": "Vegetal from fruit",       "defecto": "0.00"},
-            {"nombre": "Insect Count",             "defecto": "0.00"},
-        ]
-    },
-    "Banana": {
-        "descripcion": "Banana",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                     "defecto": "0.00"},
-            {"nombre": "Decay",                    "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": "0.00"},
-            {"nombre": "Color variation",          "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Splits",                   "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Dragon Fruit": {
-        "descripcion": "Pitahaya / Dragon Fruit",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Decay",                    "defecto": "0.00"},
-            {"nombre": "Insect, mould, sun damage","defecto": "0.00"},
-            {"nombre": "Color Variation",          "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Broken / Small Pieces",    "defecto": ""},
-            {"nombre": "Blocked",                  "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-            {"nombre": "Foreign Matter",           "defecto": "0.00"},
-        ]
-    },
-    "Mango": {
-        "descripcion": "Mango",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                     "defecto": "0.00"},
-            {"nombre": "Decay",                    "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": "0.00"},
-            {"nombre": "Color variation",          "defecto": ""},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Blocked",                  "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Durazno": {
-        "descripcion": "Durazno (Peach)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Stem",                     "defecto": "0.00"},
-            {"nombre": "Decay",                    "defecto": "0.00"},
-            {"nombre": "Insect, mold, sun Damage", "defecto": "0.00"},
-            {"nombre": "Color variation",          "defecto": "0.00"},
-            {"nombre": "Overmatured / Crushed",    "defecto": ""},
-            {"nombre": "Splits",                   "defecto": ""},
-            {"nombre": "Vegetable Matter",         "defecto": "0.00"},
-        ]
-    },
-    "Piña": {
-        "descripcion": "Piña (Pineapple)",
-        "columnas": 2,
-        "parametros": [
-            {"nombre": "Decay",                        "defecto": ""},
-            {"nombre": "Mechanical, insect, mold, sun damage", "defecto": ""},
-            {"nombre": "Color variation",              "defecto": ""},
-            {"nombre": "Overmatured / Crushed",        "defecto": ""},
-            {"nombre": "Small pieces / Splits",        "defecto": ""},
-            {"nombre": "Vegetable Matter",             "defecto": ""},
-            {"nombre": "Foreign Matter",               "defecto": ""},
-        ]
-    },
-}
-
-DEFAULT_CLIENT_MAP = [
-    {"keyword": "camerican",   "formato": "Camerican"},
-    {"keyword": "livemore",    "formato": "Livemore"},
-    {"keyword": "trader joe",  "formato": "Trader Joe's"},
-    {"keyword": "inabata",     "formato": "Inabata / Korea"},
-    {"keyword": "korea",       "formato": "Inabata / Korea"},
-    {"keyword": "woodland",    "formato": "Woodland Partners"},
-    {"keyword": "woolworths",  "formato": "Woolworths / Macro"},
-    {"keyword": "macro",       "formato": "Woolworths / Macro"},
-    {"keyword": "vlm",         "formato": "VLM Kit Estandar"},
-    {"keyword": "great value", "formato": "VLM Great Value"},
-]
-DEFAULT_BRAND_MAP = [
-    {"keyword": "food lion",        "formato": "Woodland Partners"},
-    {"keyword": "bowl & basket",    "formato": "Woodland Partners"},
-    {"keyword": "bowl and basket",  "formato": "Woodland Partners"},
-    {"keyword": "nature's promise", "formato": "Woodland Partners"},
-    {"keyword": "natures promise",  "formato": "Woodland Partners"},
-    {"keyword": "wholesome pantry", "formato": "Woodland Partners"},
-    {"keyword": "shoprite",         "formato": "Woodland Partners"},
-    {"keyword": "hannaford",        "formato": "Woodland Partners"},
-]
-
-def load_config():
-    defaults = {
-        "pdf_folder":      "C:/COA Generator/PL",
-        "template_folder": "C:/COA Generator/Templates",
-        "output_folder":   "C:/Users/jibarra/Mi unidad/1. CoAs/1. EXPORTACIÓN",
-        "micro_formats":   DEFAULT_MICRO_FORMATS,
-        "quality_formats": DEFAULT_QUALITY_FORMATS,
-        "client_map":      DEFAULT_CLIENT_MAP,
-        "brand_map":       DEFAULT_BRAND_MAP,
-    }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for key in defaults:
-                    if key not in data:
-                        data[key] = defaults[key]
-                for fname, fdata in DEFAULT_MICRO_FORMATS.items():
-                    if fname not in data["micro_formats"]:
-                        data["micro_formats"][fname] = fdata
-                for fname, fdata in DEFAULT_QUALITY_FORMATS.items():
-                    if fname not in data["quality_formats"]:
-                        data["quality_formats"][fname] = fdata
-                if "client_map" not in data:
-                    data["client_map"] = DEFAULT_CLIENT_MAP
-                if "brand_map" not in data:
-                    data["brand_map"] = DEFAULT_BRAND_MAP
-                return data
-        except Exception:
-            pass
-    return defaults
-
-def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
-
-config = load_config()
+config = load_config(CONFIG_FILE)
 
 logging.basicConfig(
     level=logging.ERROR,
@@ -415,173 +48,29 @@ logging.basicConfig(
     filename='error_log.txt', filemode='w'
 )
 
-# ============================================================
-# HISTORIAL MICROBIOLOGÍA
-# ============================================================
 
 def _normalizar_producto(nombre):
-    return re.sub(r'\b\d+\s*(?:oz|g|kg|lb|ml|l)\b', '', nombre, flags=re.IGNORECASE).strip().lower()
+    return normalize_product_name(nombre)
 
-def load_micro_history():
-    """Carga historial de TODAS las hojas del Excel (una por formato)."""
-    history = {}
-    if not os.path.exists(MICRO_HISTORY):
-        return history
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(MICRO_HISTORY)
-        for ws in wb.worksheets:
-            if ws.max_row < 2:
-                continue
-            headers = [cell.value for cell in ws[1]]
-            if not headers or headers[0] is None:
-                continue
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if not row[0]:
-                    continue
-                record = dict(zip(headers, row))
-                key = (
-                    str(record.get("Cliente", "")).lower().strip(),
-                    _normalizar_producto(str(record.get("Producto", ""))),
-                    str(record.get("Lote", "")).strip()
-                )
-                # Si ya existe el key, combinar los valores (pueden venir de hojas distintas)
-                if key in history:
-                    for k, v in record.items():
-                        if v and not history[key].get(k):
-                            history[key][k] = v
-                else:
-                    history[key] = record
-    except Exception as e:
-        logging.error(f"Error cargando historial micro: {e}")
-    return history
 
 def save_micro_history_record(cliente, producto, lote, micro_values, formato_nombre=""):
-    """Guarda en una hoja separada por formato microbiológico."""
-    try:
-        import openpyxl
+    return _storage_save_micro_history_record(
+        cliente,
+        producto,
+        lote,
+        micro_values,
+        config,
+        formato_nombre=formato_nombre,
+        history_file=MICRO_HISTORY,
+    )
 
-        # Obtener claves del formato específico
-        fmt     = config["micro_formats"].get(formato_nombre, {})
-        params  = fmt.get("parametros", [])
-        tipo    = fmt.get("tipo", "simple")
-        # Expandir claves n_series (_n1 a _n5) para VLM Great Value y similares
-        claves = []
-        for p in params:
-            clave = p["clave"]
-            if tipo == "n_series" and p.get("n_series", False):
-                for n in range(1, 6):
-                    claves.append(f"{clave}_n{n}")
-            else:
-                claves.append(clave)
-        if not claves:
-            claves = sorted(micro_values.keys())
-
-        headers = ["Cliente", "Producto", "Lote"] + claves + ["Fecha"]
-
-        # Nombre de hoja: primeros 31 chars (límite Excel)
-        # Limpiar nombre de hoja: quitar caracteres prohibidos como / \ ? * : [ ]
-        nombre_limpio = re.sub(r'[\\/*?:\[\]]', '-', formato_nombre or "General")
-        sheet_name = nombre_limpio[:31] # Cortar a 31 caracteres para Excel
-
-        if os.path.exists(MICRO_HISTORY):
-            wb = openpyxl.load_workbook(MICRO_HISTORY)
-        else:
-            wb = openpyxl.Workbook()
-            # Eliminar hoja vacía por defecto
-            if "Sheet" in wb.sheetnames:
-                del wb["Sheet"]
-
-        # Obtener o crear hoja para este formato
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-        else:
-            ws = wb.create_sheet(title=sheet_name)
-            ws.append(headers)
-            for cell in ws[1]:
-                cell.font = openpyxl.styles.Font(bold=True)
-
-        prod_norm = _normalizar_producto(producto)
-        cliente_l = cliente.lower().strip()
-        row_idx   = None
-        for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            if (str(row[0] or "").lower().strip() == cliente_l and
-                    _normalizar_producto(str(row[1] or "")) == prod_norm and
-                    str(row[2] or "").strip() == lote):
-                row_idx = i
-                break
-
-        nueva_fila = [cliente, producto, lote]
-        for k in claves:
-            nueva_fila.append(micro_values.get(k, ""))
-        nueva_fila.append(datetime.now().strftime("%d/%m/%Y %H:%M"))
-
-        if row_idx:
-            for col, val in enumerate(nueva_fila, start=1):
-                ws.cell(row=row_idx, column=col, value=val)
-        else:
-            ws.append(nueva_fila)
-
-        # Ajustar ancho columnas
-        for col in ws.columns:
-            max_len = max((len(str(cell.value or "")) for cell in col), default=10)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
-
-        wb.save(MICRO_HISTORY)
-    except Exception as e:
-        logging.error(f"Error guardando historial micro: {e}")
-
-# ============================================================
-# REGISTRO COAs
-# ============================================================
 
 def get_registro_path():
-    """Registro siempre en la carpeta del programa, junto a config.json."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), COA_REGISTRY)
+    return _storage_get_registro_path(APP_DIR)
+
 
 def registrar_coa(filas):
-    """Registro de COAs — una hoja por año, siempre en carpeta del programa."""
-    try:
-        import openpyxl
-        registro_path = get_registro_path()
-        headers       = ["Fecha Generación", "Embarque", "Cliente", "PO",
-                         "Producto", "Lotes", "Cajas Totales", "Archivo Generado"]
-        año_actual    = str(datetime.now().year)
-
-        if os.path.exists(registro_path):
-            try:
-                wb = openpyxl.load_workbook(registro_path)
-            except Exception:
-                # Archivo corrupto o abierto — crear nuevo con sufijo
-                registro_path = registro_path.replace(".xlsx", f"_{datetime.now().strftime('%H%M%S')}.xlsx")
-                wb = openpyxl.Workbook()
-                if "Sheet" in wb.sheetnames:
-                    del wb["Sheet"]
-        else:
-            wb = openpyxl.Workbook()
-            if "Sheet" in wb.sheetnames:
-                del wb["Sheet"]
-
-        # Una hoja por año
-        if año_actual in wb.sheetnames:
-            ws = wb[año_actual]
-        else:
-            ws = wb.create_sheet(title=año_actual)
-            ws.append(headers)
-            for cell in ws[1]:
-                cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
-                cell.fill = openpyxl.styles.PatternFill("solid", fgColor="2F5496")
-
-        for fila in filas:
-            ws.append(fila)
-
-        for col in ws.columns:
-            max_len = max((len(str(cell.value or "")) for cell in col), default=10)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
-
-        wb.save(registro_path)
-    except Exception as e:
-        logging.error(f"Error guardando registro COAs: {e}")
+    return _storage_registrar_coa(filas, APP_DIR)
 
 # ============================================================
 # TIPOS DE TABLA MICRO
@@ -2136,7 +1625,6 @@ def _detect_quality_format(producto):
                         return cfg_name
                 return fmt_name
     return list(config.get('quality_formats', {}).keys())[0] if config.get('quality_formats') else ''
-
 class COAGeneratorApp:
     def __init__(self, root):
         self.root = root
@@ -2298,49 +1786,29 @@ class COAGeneratorApp:
         """Ventana Acerca de."""
         win = tk.Toplevel(self.root)
         win.title("Acerca de")
-        win.geometry("420x320")
+        win.geometry("420x250")
         win.resizable(False, False)
         win.configure(bg="#C8DFF0")
         win.grab_set()
-        # Centrar en pantalla
         win.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width()  - 420) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 320) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 250) // 2
         win.geometry(f"+{x}+{y}")
 
-        # Contenido
         tk.Label(win, text="Generador de COAs",
             bg="#C8DFF0", fg="#0D2137",
-            font=("Segoe UI", 16, "bold")).pack(pady=(28, 4))
-        tk.Label(win, text=f"Versión {APP_VERSION}",
-            bg="#C8DFF0", fg="#255F96",
-            font=("Segoe UI", 10)).pack(pady=(0, 20))
+            font=("Segoe UI", 16, "bold")).pack(pady=(28, 8))
         sep = tk.Frame(win, bg="#8AB4D4", height=1)
-        sep.pack(fill=tk.X, padx=40)
+        sep.pack(fill=tk.X, padx=40, pady=(0, 18))
         tk.Label(win,
             text="Desarrollado por José Ibarra\nControl de Calidad — Exportación",
             bg="#C8DFF0", fg="#2A4A6B",
-            font=("Segoe UI", 10), justify="center").pack(pady=18)
-        # Historial de versiones resumido
-        hist = [
-            ("v2.6", "Checkmarks por paso, validación pre-generación,"),
-            ("",     "carpeta de origen en template, Acerca de."),
-            ("v2.5", "Sesión guardada, aviso duplicados, editor de"),
-            ("",     "clientes/marcas, log de errores, botones orden."),
-            ("v2.4", "Detección de mixes, UI Frutiger Aero,"),
-            ("",     "navegación con flechas, autodetección formatos."),
-            ("v2.0", "Primera versión completa."),
-        ]
-        hist_frame = tk.Frame(win, bg="#C8DFF0")
-        hist_frame.pack(padx=40, fill=tk.X)
-        for ver, desc in hist:
-            row = tk.Frame(hist_frame, bg="#C8DFF0")
-            row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=ver, bg="#C8DFF0", fg="#255F96",
-                font=("Segoe UI", 8, "bold"), width=6, anchor="w").pack(side=tk.LEFT)
-            tk.Label(row, text=desc, bg="#C8DFF0", fg="#2A4A6B",
-                font=("Segoe UI", 8), anchor="w").pack(side=tk.LEFT)
-        ttk.Button(win, text="Cerrar", command=win.destroy).pack(pady=16)
+            font=("Segoe UI", 10), justify="center").pack(pady=(0, 10))
+        tk.Label(win,
+            text="Herramienta interna para generación de COAs\ny registro operativo.",
+            bg="#C8DFF0", fg="#255F96",
+            font=("Segoe UI", 9), justify="center").pack(pady=(0, 18))
+        ttk.Button(win, text="Cerrar", command=win.destroy).pack(pady=12)
 
     def _apply_arrow_nav_main(self):
         """Registra navegación con flechas en los campos editables de la ventana principal."""
@@ -2538,6 +2006,27 @@ class COAGeneratorApp:
         row6b.pack(fill=tk.X)
         ttk.Button(row6b, text="📋 Ver Registro",
                    command=self.open_registro).pack(side=tk.LEFT, padx=(0,6))
+
+    def _show_step_25(self):
+        """Muestra el paso 2.5 siempre entre el paso 2 y el paso 3."""
+        if self.s25.winfo_manager():
+            self.s25.pack_forget()
+        self.s25.pack(fill=tk.X, padx=10, pady=4, after=self.summary_text.master)
+
+    def _set_template_for_product(self, producto, path, auto=False):
+        if not path:
+            return
+        carpeta = os.path.basename(os.path.dirname(path))
+        texto = (f"✔ Auto: {os.path.basename(path)}  —  📂 {carpeta}"
+                 if auto else
+                 f"{os.path.basename(path)}  —  📂 {carpeta}")
+        self.product_widgets[producto]['path'] = path
+        self.product_widgets[producto]['label_var'].set(texto)
+        self.product_widgets[producto]['button'].configure(style="Success.TButton")
+        cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
+        if is_camerican(cliente_actual):
+            self._refresh_camerican_fields(producto, path)
+        self.check_if_ready_to_generate()
 
     def _build_config_tab(self):
         cfg_nb = ttk.Notebook(self.tab_config)
@@ -3021,9 +2510,7 @@ class COAGeneratorApp:
                 return
             self.update_summary_text()
             self._fill_editable_fields()
-            # Insertar s25 entre s2 y s3 usando place en el canvas frame
-            self.s25.pack(fill=tk.X, padx=10, pady=4,
-                          after=self.summary_text.master)
+            self._show_step_25()
             productos = sorted(set(p['producto'] for p in self.all_data['products']))
             for prod in productos:
                 self.add_product_widget(prod)
@@ -3221,7 +2708,7 @@ class COAGeneratorApp:
         if self._es_mix(producto):
             cliente_words = [w for w in re.split(r"[\s\-_/]+", cliente)
                              if len(w) > 2]
-            for dirpath, dirs, files in os.walk(template_folder):
+            for dirpath, _, files in os.walk(template_folder):
                 folder_low = dirpath.lower()
                 # La carpeta debe corresponder al cliente
                 if not any(w in folder_low for w in cliente_words):
@@ -3242,25 +2729,19 @@ class COAGeneratorApp:
 
         best_path  = ""
         best_score = 0
-        for dirpath, dirs, files in os.walk(template_folder):
+        best_fname_score = -1
+        for dirpath, _, files in os.walk(template_folder):
             for fname in files:
                 if not fname.lower().endswith(".docx"):
                     continue
                 fpath      = os.path.join(dirpath, fname)
-                fname_low  = fname.lower()
-                folder_low = dirpath.lower()
-                combined   = fname_low + " " + folder_low
-                score = 0
-                for w in prod_words:
-                    if w in combined:
-                        score += 2
-                for w in cliente_words:
-                    if w in combined:
-                        score += 1
-                if score > best_score:
+                score      = score_template_candidate(producto, cliente, fpath, ignore)
+                fname_score = score_template_candidate(producto, "", fpath, ignore)
+                if score > best_score or (score == best_score and fname_score > best_fname_score):
                     best_score = score
-                    best_path  = fpath
-        return best_path if best_score >= 2 else ""
+                    best_fname_score = fname_score
+                    best_path = fpath
+        return best_path if best_score >= 4 else ""
 
     def add_product_widget(self, producto):
         pf = ttk.Frame(self.products_frame)
@@ -3279,13 +2760,7 @@ class COAGeneratorApp:
         # Intentar auto-detectar template
         auto_path = self._find_template_auto(producto)
         if auto_path:
-            self.product_widgets[producto]['path'] = auto_path
-            lv.set(f"\u2714 Auto: {os.path.basename(auto_path)}  —  📂 {os.path.basename(os.path.dirname(auto_path))}")
-            btn.configure(style="Success.TButton")
-            cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
-            if is_camerican(cliente_actual):
-                self._refresh_camerican_fields(producto, auto_path)
-            self.check_if_ready_to_generate()
+            self._set_template_for_product(producto, auto_path, auto=True)
         else:
             lv.set("Ninguna plantilla seleccionada.")
 
@@ -3296,16 +2771,7 @@ class COAGeneratorApp:
             initialdir=config.get("template_folder", "")
         )
         if path:
-            self.product_widgets[producto]['path'] = path
-            carpeta = os.path.basename(os.path.dirname(path))
-            self.product_widgets[producto]['label_var'].set(
-                f"{os.path.basename(path)}  \u2014  \U0001f4c2 {carpeta}")
-            self.product_widgets[producto]['button'].configure(style="Success.TButton")
-            self.check_if_ready_to_generate()
-            # Si es Camerican y el paso 2.5 ya fue construido, refrescar campos
-            cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
-            if is_camerican(cliente_actual):
-                self._refresh_camerican_fields(producto, path)
+            self._set_template_for_product(producto, path)
 
     def _refresh_camerican_fields(self, producto, template_path):
         """Reconstruye los campos Brix/defectos Camerican cuando se asigna el template."""
@@ -3423,19 +2889,14 @@ class COAGeneratorApp:
                 "micro_formatos": self._micro_formatos,
                 "micro_results":  self._micro_results,
             }
-            spath = os.path.join(os.path.dirname(os.path.abspath(__file__)), SESSION_FILE)
-            with open(spath, "w", encoding="utf-8") as f:
-                json.dump(session, f, indent=2, ensure_ascii=False)
+            save_session_data(session, APP_DIR)
         except Exception:
             pass
 
     def load_session(self):
         """Carga sesion guardada. Devuelve dict o None."""
         try:
-            spath = os.path.join(os.path.dirname(os.path.abspath(__file__)), SESSION_FILE)
-            if os.path.exists(spath):
-                with open(spath, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            return load_session_data(APP_DIR)
         except Exception:
             pass
         return None
@@ -3475,7 +2936,7 @@ class COAGeneratorApp:
         self.edit_sello.set(session.get("sello", ""))
         self.edit_recorder.set(session.get("recorder", ""))
         self.edit_palletized.set(session.get("palletized", "pallet"))
-        self.s25.pack(fill=tk.X, padx=14, pady=5)
+        self._show_step_25()
         self._fill_editable_fields()
         self.update_summary_text()
         templates = session.get("templates", {})
@@ -3484,9 +2945,7 @@ class COAGeneratorApp:
             self.add_product_widget(prod)
             path = templates.get(prod, "")
             if path and os.path.exists(path):
-                self.product_widgets[prod]["path"] = path
-                self.product_widgets[prod]["label_var"].set("Plantilla: " + os.path.basename(path))
-                self.product_widgets[prod]["button"].configure(style="Success.TButton")
+                self._set_template_for_product(prod, path)
         self._micro_formatos = session.get("micro_formatos", {})
         self._micro_results  = session.get("micro_results",  {})
         if self._micro_results:
