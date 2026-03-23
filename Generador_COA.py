@@ -16,6 +16,7 @@ import sys
 from datetime import datetime
 
 from coa_formats import DEFAULT_BRAND_MAP, DEFAULT_CLIENT_MAP
+from coa_template_match import score_template_candidate
 
 from coa_storage import (
     CONFIG_FILE,
@@ -1624,7 +1625,6 @@ def _detect_quality_format(producto):
                         return cfg_name
                 return fmt_name
     return list(config.get('quality_formats', {}).keys())[0] if config.get('quality_formats') else ''
-
 class COAGeneratorApp:
     def __init__(self, root):
         self.root = root
@@ -2006,6 +2006,27 @@ class COAGeneratorApp:
         row6b.pack(fill=tk.X)
         ttk.Button(row6b, text="📋 Ver Registro",
                    command=self.open_registro).pack(side=tk.LEFT, padx=(0,6))
+
+    def _show_step_25(self):
+        """Muestra el paso 2.5 siempre entre el paso 2 y el paso 3."""
+        if self.s25.winfo_manager():
+            self.s25.pack_forget()
+        self.s25.pack(fill=tk.X, padx=10, pady=4, after=self.summary_text.master)
+
+    def _set_template_for_product(self, producto, path, auto=False):
+        if not path:
+            return
+        carpeta = os.path.basename(os.path.dirname(path))
+        texto = (f"✔ Auto: {os.path.basename(path)}  —  📂 {carpeta}"
+                 if auto else
+                 f"{os.path.basename(path)}  —  📂 {carpeta}")
+        self.product_widgets[producto]['path'] = path
+        self.product_widgets[producto]['label_var'].set(texto)
+        self.product_widgets[producto]['button'].configure(style="Success.TButton")
+        cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
+        if is_camerican(cliente_actual):
+            self._refresh_camerican_fields(producto, path)
+        self.check_if_ready_to_generate()
 
     def _build_config_tab(self):
         cfg_nb = ttk.Notebook(self.tab_config)
@@ -2489,9 +2510,7 @@ class COAGeneratorApp:
                 return
             self.update_summary_text()
             self._fill_editable_fields()
-            # Insertar s25 entre s2 y s3 usando place en el canvas frame
-            self.s25.pack(fill=tk.X, padx=10, pady=4,
-                          after=self.summary_text.master)
+            self._show_step_25()
             productos = sorted(set(p['producto'] for p in self.all_data['products']))
             for prod in productos:
                 self.add_product_widget(prod)
@@ -2689,7 +2708,7 @@ class COAGeneratorApp:
         if self._es_mix(producto):
             cliente_words = [w for w in re.split(r"[\s\-_/]+", cliente)
                              if len(w) > 2]
-            for dirpath, dirs, files in os.walk(template_folder):
+            for dirpath, _, files in os.walk(template_folder):
                 folder_low = dirpath.lower()
                 # La carpeta debe corresponder al cliente
                 if not any(w in folder_low for w in cliente_words):
@@ -2710,25 +2729,19 @@ class COAGeneratorApp:
 
         best_path  = ""
         best_score = 0
-        for dirpath, dirs, files in os.walk(template_folder):
+        best_fname_score = -1
+        for dirpath, _, files in os.walk(template_folder):
             for fname in files:
                 if not fname.lower().endswith(".docx"):
                     continue
                 fpath      = os.path.join(dirpath, fname)
-                fname_low  = fname.lower()
-                folder_low = dirpath.lower()
-                combined   = fname_low + " " + folder_low
-                score = 0
-                for w in prod_words:
-                    if w in combined:
-                        score += 2
-                for w in cliente_words:
-                    if w in combined:
-                        score += 1
-                if score > best_score:
+                score      = score_template_candidate(producto, cliente, fpath, ignore)
+                fname_score = score_template_candidate(producto, "", fpath, ignore)
+                if score > best_score or (score == best_score and fname_score > best_fname_score):
                     best_score = score
-                    best_path  = fpath
-        return best_path if best_score >= 2 else ""
+                    best_fname_score = fname_score
+                    best_path = fpath
+        return best_path if best_score >= 4 else ""
 
     def add_product_widget(self, producto):
         pf = ttk.Frame(self.products_frame)
@@ -2747,13 +2760,7 @@ class COAGeneratorApp:
         # Intentar auto-detectar template
         auto_path = self._find_template_auto(producto)
         if auto_path:
-            self.product_widgets[producto]['path'] = auto_path
-            lv.set(f"\u2714 Auto: {os.path.basename(auto_path)}  —  📂 {os.path.basename(os.path.dirname(auto_path))}")
-            btn.configure(style="Success.TButton")
-            cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
-            if is_camerican(cliente_actual):
-                self._refresh_camerican_fields(producto, auto_path)
-            self.check_if_ready_to_generate()
+            self._set_template_for_product(producto, auto_path, auto=True)
         else:
             lv.set("Ninguna plantilla seleccionada.")
 
@@ -2764,16 +2771,7 @@ class COAGeneratorApp:
             initialdir=config.get("template_folder", "")
         )
         if path:
-            self.product_widgets[producto]['path'] = path
-            carpeta = os.path.basename(os.path.dirname(path))
-            self.product_widgets[producto]['label_var'].set(
-                f"{os.path.basename(path)}  \u2014  \U0001f4c2 {carpeta}")
-            self.product_widgets[producto]['button'].configure(style="Success.TButton")
-            self.check_if_ready_to_generate()
-            # Si es Camerican y el paso 2.5 ya fue construido, refrescar campos
-            cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
-            if is_camerican(cliente_actual):
-                self._refresh_camerican_fields(producto, path)
+            self._set_template_for_product(producto, path)
 
     def _refresh_camerican_fields(self, producto, template_path):
         """Reconstruye los campos Brix/defectos Camerican cuando se asigna el template."""
@@ -2938,7 +2936,7 @@ class COAGeneratorApp:
         self.edit_sello.set(session.get("sello", ""))
         self.edit_recorder.set(session.get("recorder", ""))
         self.edit_palletized.set(session.get("palletized", "pallet"))
-        self.s25.pack(fill=tk.X, padx=14, pady=5)
+        self._show_step_25()
         self._fill_editable_fields()
         self.update_summary_text()
         templates = session.get("templates", {})
@@ -2947,9 +2945,7 @@ class COAGeneratorApp:
             self.add_product_widget(prod)
             path = templates.get(prod, "")
             if path and os.path.exists(path):
-                self.product_widgets[prod]["path"] = path
-                self.product_widgets[prod]["label_var"].set("Plantilla: " + os.path.basename(path))
-                self.product_widgets[prod]["button"].configure(style="Success.TButton")
+                self._set_template_for_product(prod, path)
         self._micro_formatos = session.get("micro_formatos", {})
         self._micro_results  = session.get("micro_results",  {})
         if self._micro_results:
