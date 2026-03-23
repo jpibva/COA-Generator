@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from datetime import datetime
 
 from coa_formats import (
@@ -18,6 +19,48 @@ CONFIG_FILE = "config.json"
 MICRO_HISTORY = "Historial_Microbiologia.xlsx"
 COA_REGISTRY = "Registro_COAs.xlsx"
 SESSION_FILE = "session.json"
+BACKUP_DIRNAME = "_backups"
+
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _create_backup(path, keep=5):
+    """Crea un backup rotativo del archivo si ya existe."""
+    if not os.path.exists(path):
+        return None
+
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    filename = os.path.basename(abs_path)
+    stem, ext = os.path.splitext(filename)
+    backup_dir = os.path.join(parent, BACKUP_DIRNAME)
+    os.makedirs(backup_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = os.path.join(backup_dir, f"{stem}_{timestamp}{ext}.bak")
+    shutil.copy2(abs_path, backup_path)
+
+    pattern = re.compile(rf"^{re.escape(stem)}_\d{{8}}_\d{{6}}_\d{{6}}{re.escape(ext)}\.bak$")
+    backups = sorted(
+        (
+            os.path.join(backup_dir, name)
+            for name in os.listdir(backup_dir)
+            if pattern.match(name)
+        ),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for old_backup in backups[keep:]:
+        try:
+            os.remove(old_backup)
+        except OSError:
+            pass
+
+    return backup_path
 
 
 def load_config(config_file=CONFIG_FILE):
@@ -54,6 +97,8 @@ def load_config(config_file=CONFIG_FILE):
 
 
 def save_config(cfg, config_file=CONFIG_FILE):
+    _ensure_parent_dir(config_file)
+    _create_backup(config_file)
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
 
@@ -162,6 +207,8 @@ def save_micro_history_record(cliente, producto, lote, micro_values, config, for
             max_len = max((len(str(cell.value or "")) for cell in col), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
 
+        _ensure_parent_dir(history_file)
+        _create_backup(history_file)
         wb.save(history_file)
     except Exception as e:
         logging.error(f"Error guardando historial micro: {e}")
@@ -219,6 +266,8 @@ def registrar_coa(filas, base_dir):
             max_len = max((len(str(cell.value or "")) for cell in col), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
 
+        _ensure_parent_dir(registro_path)
+        _create_backup(registro_path)
         wb.save(registro_path)
     except Exception as e:
         logging.error(f"Error guardando registro COAs: {e}")
@@ -229,7 +278,10 @@ def get_session_path(base_dir):
 
 
 def save_session_data(session, base_dir):
-    with open(get_session_path(base_dir), "w", encoding="utf-8") as f:
+    session_path = get_session_path(base_dir)
+    _ensure_parent_dir(session_path)
+    _create_backup(session_path)
+    with open(session_path, "w", encoding="utf-8") as f:
         json.dump(session, f, indent=2, ensure_ascii=False)
 
 
