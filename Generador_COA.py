@@ -1092,12 +1092,35 @@ def _extract_micro_from_text(raw_text, source_pdf=""):
 
 
 def _extract_micro_from_pdf(pdf_path):
+    text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             text = "\n".join((p.extract_text() or "") for p in pdf.pages)
     except Exception:
+        text = ""
+    if not text.strip():
+        text = _extract_text_from_pdf_with_ocr(pdf_path)
+    if not text.strip():
         return []
     return _extract_micro_from_text(text, source_pdf=pdf_path)
+
+
+def _extract_text_from_pdf_with_ocr(pdf_path):
+    """Fallback OCR para PDFs escaneados (si librerías OCR están disponibles)."""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except Exception:
+        return ""
+
+    texts = []
+    try:
+        images = convert_from_path(pdf_path, dpi=300)
+        for img in images:
+            texts.append(pytesseract.image_to_string(img, lang="eng+spa"))
+    except Exception:
+        return ""
+    return "\n".join(texts)
 
 
 def _merge_detected_micro_blocks(blocks):
@@ -1922,8 +1945,10 @@ class COAGeneratorApp:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8,0))
         self.tab_gen    = ttk.Frame(self.notebook)
+        self.tab_micro  = ttk.Frame(self.notebook)
         self.tab_config = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_gen,    text="  📋 Generador  ")
+        self.notebook.add(self.tab_micro,  text="  🧪 Gestión Micro  ")
         self.notebook.add(self.tab_config, text="  ⚙ Configuración  ")
         # Botón Acerca de — esquina superior derecha
         about_btn = tk.Button(root, text="ℹ  Acerca de",
@@ -1933,6 +1958,7 @@ class COAGeneratorApp:
         about_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
 
         self._build_generator_tab()
+        self._build_micro_tab()
         self._build_config_tab()
 
         # Barra de progreso (encima del status bar)
@@ -2193,6 +2219,74 @@ class COAGeneratorApp:
         if self.s25.winfo_manager():
             self.s25.pack_forget()
         self.s25.pack(fill=tk.X, padx=10, pady=4, after=self.summary_text.master)
+
+    def _build_micro_tab(self):
+        PAD = dict(padx=10, pady=6)
+        main = ttk.Frame(self.tab_micro)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.LabelFrame(main, text="  Gestión Microbiológica (independiente del COA)  ", padding=(12, 8))
+        top.pack(fill=tk.X, **PAD)
+
+        self.micro_mgmt_cliente = tk.StringVar()
+        self.micro_mgmt_producto = tk.StringVar()
+        self.micro_mgmt_lotes = tk.StringVar()
+        self.micro_mgmt_pdf_paths = []
+
+        row1 = ttk.Frame(top)
+        row1.pack(fill=tk.X, pady=3)
+        ttk.Label(row1, text="Cliente:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row1, textvariable=self.micro_mgmt_cliente, width=42).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(top)
+        row2.pack(fill=tk.X, pady=3)
+        ttk.Label(row2, text="Producto (manual):").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row2, textvariable=self.micro_mgmt_producto, width=42).pack(side=tk.LEFT)
+
+        row3 = ttk.Frame(top)
+        row3.pack(fill=tk.X, pady=3)
+        ttk.Label(row3, text="Lotes (coma):").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row3, textvariable=self.micro_mgmt_lotes, width=42).pack(side=tk.LEFT)
+
+        row4 = ttk.Frame(top)
+        row4.pack(fill=tk.X, pady=3)
+        ttk.Button(row4, text="📄 Seleccionar PDF(s) de laboratorio", command=self._pick_micro_pdfs).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row4, text="🧹 Limpiar PDF(s)", command=self._clear_micro_pdfs).pack(side=tk.LEFT)
+
+        self.micro_mgmt_pdf_label = ttk.Label(
+            top,
+            text="Sin PDF cargados. Puedes trabajar manualmente con Producto + Lotes.",
+            foreground="#2A4A6B",
+            font=("Segoe UI", 9, "italic")
+        )
+        self.micro_mgmt_pdf_label.pack(anchor=tk.W, pady=(4, 0))
+
+        actions = ttk.Frame(main)
+        actions.pack(fill=tk.X, **PAD)
+        ttk.Button(actions, text="🧪 Abrir gestor microbiológico", style="Accent.TButton",
+                   command=self.open_micro_management).pack(side=tk.LEFT)
+        ttk.Label(actions,
+                  text="Puedes abrir sin PDF: editarás manualmente; con PDF: precarga y fusión.",
+                  foreground="#2A4A6B", font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=12)
+
+    def _pick_micro_pdfs(self):
+        paths = filedialog.askopenfilenames(
+            title="Selecciona PDF(s) de microbiología",
+            filetypes=[("PDF files", "*.pdf")],
+            initialdir=config.get("pdf_folder", "")
+        )
+        if not paths:
+            return
+        self.micro_mgmt_pdf_paths = list(paths)
+        self.micro_mgmt_pdf_label.configure(
+            text=f"{len(self.micro_mgmt_pdf_paths)} PDF(s) seleccionados."
+        )
+
+    def _clear_micro_pdfs(self):
+        self.micro_mgmt_pdf_paths = []
+        self.micro_mgmt_pdf_label.configure(
+            text="Sin PDF cargados. Puedes trabajar manualmente con Producto + Lotes."
+        )
 
     def _set_template_for_product(self, producto, path, auto=False):
         if not path:
@@ -3277,29 +3371,34 @@ class COAGeneratorApp:
             self._set_step_done(5, True)
 
     def open_micro_management(self):
-        """Gestión microbiológica separada basada en PDFs de laboratorio."""
-        pdf_paths = filedialog.askopenfilenames(
-            title="Selecciona PDF(s) de microbiología",
-            filetypes=[("PDF files", "*.pdf")],
-            initialdir=config.get("pdf_folder", "")
-        )
-        if not pdf_paths:
-            return
+        """Gestión microbiológica separada: manual o con PDFs."""
+        pdf_paths = list(getattr(self, "micro_mgmt_pdf_paths", []))
+        cliente_actual = (self.micro_mgmt_cliente.get().strip()
+                          or self.all_data.get("general_info", {}).get("cliente", ""))
+        producto_manual = self.micro_mgmt_producto.get().strip()
+        lotes_manual = [l.strip() for l in self.micro_mgmt_lotes.get().split(",") if l.strip()]
 
         all_blocks = []
         for p in pdf_paths:
             all_blocks.extend(_extract_micro_from_pdf(p))
-        if not all_blocks:
-            messagebox.showwarning(
-                "Sin resultados",
-                "No se detectaron resultados microbiológicos en los PDF seleccionados."
-            )
-            return
 
-        cliente_actual = self.all_data.get("general_info", {}).get("cliente", "")
-        productos_lotes, productos_formatos, prefill_results, meta = _merge_detected_micro_blocks(all_blocks)
+        productos_lotes, productos_formatos, prefill_results, meta = _merge_detected_micro_blocks(all_blocks) if all_blocks else ({}, {}, {}, {})
+
+        if producto_manual and lotes_manual:
+            canon = _canonical_product_name(producto_manual)
+            productos_lotes.setdefault(canon, [])
+            productos_lotes[canon].extend(lotes_manual)
+            productos_lotes[canon] = sorted(list(dict.fromkeys(productos_lotes[canon])))
+            productos_formatos.setdefault(canon, _detect_micro_format(cliente_actual, canon))
+            prefill_results.setdefault(canon, {})
+            for lt in lotes_manual:
+                prefill_results[canon].setdefault(lt, {})
+
         if not productos_lotes:
-            messagebox.showwarning("Sin lotes", "No se detectaron lotes válidos en los PDF.")
+            messagebox.showwarning(
+                "Sin datos",
+                "No hay datos para gestionar.\n\nCarga PDF(s) o ingresa Producto + Lotes manualmente."
+            )
             return
 
         for prod in list(productos_formatos.keys()):
