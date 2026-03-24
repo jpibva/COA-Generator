@@ -2184,6 +2184,13 @@ class COAGeneratorApp:
         self.micro_button = ttk.Button(row5, text="🔬  Ingresar / Revisar Microbiología",
                    command=self.open_micro_dialog, state=tk.DISABLED)
         self.micro_button.pack(side=tk.LEFT, padx=(0,12))
+        self.micro_manage_button = ttk.Button(
+            row5,
+            text="🧪  Gestión Microbiológica (PDF)",
+            command=self.open_micro_management,
+            state=tk.DISABLED
+        )
+        self.micro_manage_button.pack(side=tk.LEFT, padx=(0,12))
         self.micro_status_label = ttk.Label(row5, text="Sin resultados ingresados.",
                    foreground="#2A4A6B", font=("Segoe UI", 9, "italic"))
         self.micro_status_label.pack(side=tk.LEFT)
@@ -3136,6 +3143,7 @@ class COAGeneratorApp:
         self.summary_text.config(state=tk.DISABLED)
         self.generate_button['state'] = tk.DISABLED
         self.micro_button['state']    = tk.DISABLED
+        self.micro_manage_button['state'] = tk.DISABLED
         self.micro_status_label['text'] = "Sin resultados ingresados."
         self.micro_status_label['foreground'] = "#2A4A6B"
 
@@ -3224,6 +3232,7 @@ class COAGeneratorApp:
         if emb:
             self.work_label.config(text=f"  Trabajando en:  {emb}  ·  PO {po}  ")
         self.micro_button["state"] = tk.NORMAL
+        self.micro_manage_button["state"] = tk.NORMAL
         self.check_if_ready_to_generate()
         self.status_label["text"] = "  Sesion restaurada correctamente."
 
@@ -3304,9 +3313,11 @@ class COAGeneratorApp:
         if self.output_folder.get() and all_set and self.product_widgets:
             self.generate_button['state'] = tk.NORMAL
             self.micro_button['state']    = tk.NORMAL
+            self.micro_manage_button['state'] = tk.NORMAL
             self.status_label['text']     = "  \u2714 Listo para generar."
         else:
             self.generate_button['state'] = tk.DISABLED
+            self.micro_manage_button['state'] = tk.DISABLED
 
     def _prepare_lotes(self):
         """Agrupa lotes por producto. Llena _productos_lotes y _productos_agg."""
