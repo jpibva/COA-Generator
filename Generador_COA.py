@@ -1,6 +1,7 @@
 import os
 import re
 import copy
+import unicodedata
 import pdfplumber
 import logging
 import traceback
@@ -22,7 +23,9 @@ from coa_storage import (
     CONFIG_FILE,
     COA_REGISTRY,
     MICRO_HISTORY,
+    MICRO_AUDIT_FILE,
     SESSION_FILE,
+    append_micro_audit_rows as _storage_append_micro_audit_rows,
     get_registro_path as _storage_get_registro_path,
     load_config,
     load_micro_history,
@@ -71,6 +74,11 @@ def get_registro_path():
 
 def registrar_coa(filas):
     return _storage_registrar_coa(filas, APP_DIR)
+
+
+def append_micro_audit_rows(rows):
+    audit_file = config.get("micro_module", {}).get("audit_file", MICRO_AUDIT_FILE)
+    return _storage_append_micro_audit_rows(rows, audit_file=audit_file)
 
 # ============================================================
 # TIPOS DE TABLA MICRO
@@ -963,12 +971,199 @@ def extract_data_from_pdf(pdf_path):
                 data["products"].extend(lots)
     return data
 
+
+def _normalize_text_token(text):
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _canonical_product_name(name):
+    aliases = config.get("product_alias_map", {}) or {}
+    norm = _normalize_text_token(name)
+    for canonical, alias_list in aliases.items():
+        if _normalize_text_token(canonical) == norm:
+            return canonical
+        for alias in alias_list or []:
+            if _normalize_text_token(alias) == norm:
+                return canonical
+    return name
+
+
+def _normalize_micro_value(raw_value):
+    """Normaliza valores microbiológicos. Convierte 10^n y notación científica a entero string."""
+    if raw_value is None:
+        return ""
+    value = str(raw_value).strip()
+    if not value:
+        return ""
+
+    v = value.replace("×", "x").replace("X", "x")
+    if re.fullmatch(r"\d+\^\d+", v):
+        b, e = v.split("^")
+        try:
+            return str(int(float(b) ** int(e)))
+        except Exception:
+            return value
+
+    sci = re.match(r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*(?:x\s*10\^?|e)\s*([+-]?\d+)\s*$", v, re.IGNORECASE)
+    if sci:
+        base = sci.group(1).replace(",", ".")
+        exp = sci.group(2)
+        try:
+            return str(int(round(float(base) * (10 ** int(exp)))))
+        except Exception:
+            return value
+    return value
+
+
+def _extract_micro_from_text(raw_text, source_pdf=""):
+    """
+    Extrae resultados microbiológicos desde texto plano de PDF.
+    Devuelve lista de bloques: [{producto, lote, resultados, source_pdf}].
+    """
+    if not raw_text:
+        return []
+
+    text = raw_text.replace("\r", "\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    lot_re = re.compile(r"\b(\d{5}(?:-\d+)?)\b")
+    product_re = re.compile(r"(?:product|producto)\s*[:\-]\s*(.+)$", re.IGNORECASE)
+    sample_re = re.compile(r"(?:sample|muestra)\s*[:\-]\s*(.+)$", re.IGNORECASE)
+
+    metric_patterns = {
+        "TPC": re.compile(r"(total\s*plate|t\.?p\.?c|ram|recuento\s*aerobios?)", re.IGNORECASE),
+        "Coliforms": re.compile(r"(total\s*coliform|coliformes?)", re.IGNORECASE),
+        "Enterobacteria": re.compile(r"(enterobacter)", re.IGNORECASE),
+        "Ecoli": re.compile(r"(e\.?\s*coli)", re.IGNORECASE),
+        "Yeast": re.compile(r"(yeast|levadur)", re.IGNORECASE),
+        "Mold": re.compile(r"(mold|mould|hong)", re.IGNORECASE),
+        "Staph": re.compile(r"(staph|staphylococcus|coagulase)", re.IGNORECASE),
+        "Salmonella": re.compile(r"(salmonella)", re.IGNORECASE),
+        "Listeria": re.compile(r"(listeria)", re.IGNORECASE),
+    }
+    value_re = re.compile(
+        r"(?:(?:<|>)\s*\d+(?:[.,]\d+)?)|(?:\d+(?:[.,]\d+)?(?:\s*(?:x|×)\s*10\^?\s*\d+)?)|(?:\d+\^\d+)|(?:negative|negativo|absence|absent|not\s*detected)",
+        re.IGNORECASE,
+    )
+
+    blocks = []
+    current = {"producto": "", "lote": "", "resultados": {}, "source_pdf": os.path.basename(source_pdf or "")}
+
+    def flush():
+        if current.get("lote") and current.get("resultados"):
+            blocks.append({
+                "producto": _canonical_product_name(current.get("producto", "") or "Producto sin nombre"),
+                "producto_original": current.get("producto", "") or "",
+                "lote": current.get("lote"),
+                "resultados": dict(current.get("resultados", {})),
+                "source_pdf": current.get("source_pdf", ""),
+            })
+
+    for ln in lines:
+        p_match = product_re.search(ln) or sample_re.search(ln)
+        if p_match:
+            current["producto"] = p_match.group(1).strip()
+
+        lots = lot_re.findall(ln)
+        if lots:
+            if current.get("lote") and current.get("resultados") and lots[0] != current["lote"]:
+                flush()
+                current["resultados"] = {}
+            current["lote"] = lots[0].split("-")[0]
+
+        for key, patt in metric_patterns.items():
+            if not patt.search(ln):
+                continue
+            vmatch = value_re.search(ln)
+            if vmatch:
+                current["resultados"][key] = _normalize_micro_value(vmatch.group(0))
+
+            # n-series: parametro (1)...(5)
+            n_match = re.search(r"\((\d)\)\s*[:\-]?\s*([^\s]+)", ln)
+            if n_match and key in {"TPC", "Coliforms", "Ecoli", "Yeast", "Mold"}:
+                idx = int(n_match.group(1))
+                if 1 <= idx <= 5:
+                    current["resultados"][f"{key}_n{idx}"] = _normalize_micro_value(n_match.group(2))
+
+    flush()
+    return blocks
+
+
+def _extract_micro_from_pdf(pdf_path):
+    text = ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+    except Exception:
+        text = ""
+    if not text.strip():
+        text = _extract_text_from_pdf_with_ocr(pdf_path)
+    if not text.strip():
+        return []
+    return _extract_micro_from_text(text, source_pdf=pdf_path)
+
+
+def _extract_text_from_pdf_with_ocr(pdf_path):
+    """Fallback OCR para PDFs escaneados (si librerías OCR están disponibles)."""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except Exception:
+        return ""
+
+    texts = []
+    try:
+        images = convert_from_path(pdf_path, dpi=300)
+        for img in images:
+            texts.append(pytesseract.image_to_string(img, lang="eng+spa"))
+    except Exception:
+        return ""
+    return "\n".join(texts)
+
+
+def _merge_detected_micro_blocks(blocks):
+    """
+    Agrupa bloques por producto/lote y fusiona resultados detectados.
+    Retorna productos_lotes, formatos, prefill_results, metadata.
+    """
+    grouped = {}
+    sources = {}
+    for b in blocks:
+        producto = _canonical_product_name(b.get("producto", "") or "Producto sin nombre")
+        lote = (b.get("lote", "") or "").split("-")[0]
+        if not lote:
+            continue
+        key = (producto, lote)
+        if key not in grouped:
+            grouped[key] = {}
+            sources[key] = set()
+        grouped[key].update(b.get("resultados", {}))
+        if b.get("source_pdf"):
+            sources[key].add(b["source_pdf"])
+
+    productos_lotes = {}
+    productos_formatos = {}
+    prefill_results = {}
+    metadata = {}
+
+    for (producto, lote), resultados in grouped.items():
+        productos_lotes.setdefault(producto, []).append(lote)
+        prefill_results.setdefault(producto, {})[lote] = resultados
+        productos_formatos.setdefault(producto, _detect_micro_format("", producto))
+        metadata[(producto, lote)] = {"sources": sorted(list(sources.get((producto, lote), set())))}
+
+    for prod in productos_lotes:
+        productos_lotes[prod] = sorted(list(dict.fromkeys(productos_lotes[prod])))
+    return productos_lotes, productos_formatos, prefill_results, metadata
+
 # ============================================================
 # VENTANA DE MICROBIOLOGÍA
 # ============================================================
 
 class MicrobiologyInputDialog(tk.Toplevel):
-    def __init__(self, parent, productos_lotes, productos_formatos, cliente, micro_history):
+    def __init__(self, parent, productos_lotes, productos_formatos, cliente, micro_history, prefill_results=None):
         super().__init__(parent)
         self.title("Resultados Microbiológicos")
         self.geometry("820x660")
@@ -979,6 +1174,7 @@ class MicrobiologyInputDialog(tk.Toplevel):
         self.productos_lotes    = productos_lotes
         self.productos_formatos = productos_formatos
         self.micro_history      = micro_history
+        self.prefill_results    = prefill_results or {}
         self.confirmed          = False
         self.vars               = {}
         self.formato_vars       = {}
@@ -1082,6 +1278,7 @@ class MicrobiologyInputDialog(tk.Toplevel):
     def _build_lot_tab(self, parent, producto, lote, params, tipo):
         hist_key = (self.cliente.lower().strip(), _normalizar_producto(producto), lote)
         hist     = self.micro_history.get(hist_key, {})
+        pref     = self.prefill_results.get(producto, {}).get(lote, {})
 
         # Barra superior con historial y botones copiar/pegar
         top_bar = ttk.Frame(parent)
@@ -1136,7 +1333,7 @@ class MicrobiologyInputDialog(tk.Toplevel):
                 row_idx += 1
                 for n in range(1, 6):
                     val_key  = f"{clave}_n{n}"
-                    hist_val = hist.get(val_key, defecto)
+                    hist_val = pref.get(val_key, hist.get(val_key, defecto))
                     ttk.Label(sf, text=f"n{n}:", width=4, anchor=tk.E).grid(
                         row=row_idx, column=(n-1)*2, padx=(4,1), pady=1, sticky=tk.E)
                     var = tk.StringVar(value=str(hist_val) if hist_val else "")
@@ -1145,7 +1342,7 @@ class MicrobiologyInputDialog(tk.Toplevel):
                     self.vars[producto][lote][val_key] = var
                 row_idx += 1
             else:
-                hist_val = hist.get(clave, defecto)
+                hist_val = pref.get(clave, hist.get(clave, defecto))
                 ttk.Label(sf, text=nombre, width=26, anchor=tk.W).grid(
                     row=row_idx, column=0, padx=5, pady=3, sticky=tk.W)
                 var = tk.StringVar(value=str(hist_val) if hist_val else "")
@@ -1748,8 +1945,10 @@ class COAGeneratorApp:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8,0))
         self.tab_gen    = ttk.Frame(self.notebook)
+        self.tab_micro  = ttk.Frame(self.notebook)
         self.tab_config = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_gen,    text="  📋 Generador  ")
+        self.notebook.add(self.tab_micro,  text="  🧪 Gestión Micro  ")
         self.notebook.add(self.tab_config, text="  ⚙ Configuración  ")
         # Botón Acerca de — esquina superior derecha
         about_btn = tk.Button(root, text="ℹ  Acerca de",
@@ -1759,6 +1958,7 @@ class COAGeneratorApp:
         about_btn.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
 
         self._build_generator_tab()
+        self._build_micro_tab()
         self._build_config_tab()
 
         # Barra de progreso (encima del status bar)
@@ -2012,6 +2212,74 @@ class COAGeneratorApp:
         if self.s25.winfo_manager():
             self.s25.pack_forget()
         self.s25.pack(fill=tk.X, padx=10, pady=4, after=self.summary_text.master)
+
+    def _build_micro_tab(self):
+        PAD = dict(padx=10, pady=6)
+        main = ttk.Frame(self.tab_micro)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.LabelFrame(main, text="  Gestión Microbiológica (independiente del COA)  ", padding=(12, 8))
+        top.pack(fill=tk.X, **PAD)
+
+        self.micro_mgmt_cliente = tk.StringVar()
+        self.micro_mgmt_producto = tk.StringVar()
+        self.micro_mgmt_lotes = tk.StringVar()
+        self.micro_mgmt_pdf_paths = []
+
+        row1 = ttk.Frame(top)
+        row1.pack(fill=tk.X, pady=3)
+        ttk.Label(row1, text="Cliente:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row1, textvariable=self.micro_mgmt_cliente, width=42).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(top)
+        row2.pack(fill=tk.X, pady=3)
+        ttk.Label(row2, text="Producto (manual):").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row2, textvariable=self.micro_mgmt_producto, width=42).pack(side=tk.LEFT)
+
+        row3 = ttk.Frame(top)
+        row3.pack(fill=tk.X, pady=3)
+        ttk.Label(row3, text="Lotes (coma):").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Entry(row3, textvariable=self.micro_mgmt_lotes, width=42).pack(side=tk.LEFT)
+
+        row4 = ttk.Frame(top)
+        row4.pack(fill=tk.X, pady=3)
+        ttk.Button(row4, text="📄 Seleccionar PDF(s) de laboratorio", command=self._pick_micro_pdfs).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row4, text="🧹 Limpiar PDF(s)", command=self._clear_micro_pdfs).pack(side=tk.LEFT)
+
+        self.micro_mgmt_pdf_label = ttk.Label(
+            top,
+            text="Sin PDF cargados. Puedes trabajar manualmente con Producto + Lotes.",
+            foreground="#2A4A6B",
+            font=("Segoe UI", 9, "italic")
+        )
+        self.micro_mgmt_pdf_label.pack(anchor=tk.W, pady=(4, 0))
+
+        actions = ttk.Frame(main)
+        actions.pack(fill=tk.X, **PAD)
+        ttk.Button(actions, text="🧪 Abrir gestor microbiológico", style="Accent.TButton",
+                   command=self.open_micro_management).pack(side=tk.LEFT)
+        ttk.Label(actions,
+                  text="Puedes abrir sin PDF: editarás manualmente; con PDF: precarga y fusión.",
+                  foreground="#2A4A6B", font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=12)
+
+    def _pick_micro_pdfs(self):
+        paths = filedialog.askopenfilenames(
+            title="Selecciona PDF(s) de microbiología",
+            filetypes=[("PDF files", "*.pdf")],
+            initialdir=config.get("pdf_folder", "")
+        )
+        if not paths:
+            return
+        self.micro_mgmt_pdf_paths = list(paths)
+        self.micro_mgmt_pdf_label.configure(
+            text=f"{len(self.micro_mgmt_pdf_paths)} PDF(s) seleccionados."
+        )
+
+    def _clear_micro_pdfs(self):
+        self.micro_mgmt_pdf_paths = []
+        self.micro_mgmt_pdf_label.configure(
+            text="Sin PDF cargados. Puedes trabajar manualmente con Producto + Lotes."
+        )
 
     def _set_template_for_product(self, producto, path, auto=False):
         if not path:
@@ -3090,6 +3358,118 @@ class COAGeneratorApp:
             self.micro_status_label['text']       = f"✔ {total} resultado(s) ingresado(s)."
             self.micro_status_label['foreground'] = "green"
             self._set_step_done(5, True)
+
+    def open_micro_management(self):
+        """Gestión microbiológica separada: manual o con PDFs."""
+        pdf_paths = list(getattr(self, "micro_mgmt_pdf_paths", []))
+        cliente_actual = (self.micro_mgmt_cliente.get().strip()
+                          or self.all_data.get("general_info", {}).get("cliente", ""))
+        producto_manual = self.micro_mgmt_producto.get().strip()
+        lotes_manual = [l.strip() for l in self.micro_mgmt_lotes.get().split(",") if l.strip()]
+
+        all_blocks = []
+        for p in pdf_paths:
+            all_blocks.extend(_extract_micro_from_pdf(p))
+
+        productos_lotes, productos_formatos, prefill_results, meta = _merge_detected_micro_blocks(all_blocks) if all_blocks else ({}, {}, {}, {})
+
+        if producto_manual and lotes_manual:
+            canon = _canonical_product_name(producto_manual)
+            productos_lotes.setdefault(canon, [])
+            productos_lotes[canon].extend(lotes_manual)
+            productos_lotes[canon] = sorted(list(dict.fromkeys(productos_lotes[canon])))
+            productos_formatos.setdefault(canon, _detect_micro_format(cliente_actual, canon))
+            prefill_results.setdefault(canon, {})
+            for lt in lotes_manual:
+                prefill_results[canon].setdefault(lt, {})
+
+        if not productos_lotes:
+            messagebox.showwarning(
+                "Sin datos",
+                "No hay datos para gestionar.\n\nCarga PDF(s) o ingresa Producto + Lotes manualmente."
+            )
+            return
+
+        for prod in list(productos_formatos.keys()):
+            productos_formatos[prod] = _detect_micro_format(cliente_actual, prod)
+
+        micro_history = load_micro_history()
+        dialogo = MicrobiologyInputDialog(
+            self.root,
+            productos_lotes,
+            productos_formatos,
+            cliente_actual,
+            micro_history,
+            prefill_results=prefill_results,
+        )
+        self.root.wait_window(dialogo)
+        if not dialogo.confirmed:
+            return
+
+        nuevos = dialogo.get_results()
+        formatos = dialogo.get_formatos()
+
+        audit_rows = []
+        cambios = 0
+        for producto, lotes_map in nuevos.items():
+            fmt_nombre = formatos.get(producto, _detect_micro_format(cliente_actual, producto))
+            for lote, values in lotes_map.items():
+                hist_key = (cliente_actual.lower().strip(), _normalizar_producto(producto), lote)
+                hist = micro_history.get(hist_key, {})
+                final_values = dict(hist)
+                for k, v in values.items():
+                    if str(v).strip():
+                        final_values[k] = _normalize_micro_value(v)
+                src_files = ", ".join(meta.get((producto, lote), {}).get("sources", []))
+                diffs = []
+                for k, new_v in final_values.items():
+                    old_v = str(hist.get(k, "")).strip()
+                    new_v_s = str(new_v).strip()
+                    if old_v != new_v_s and k not in {"Cliente", "Producto", "Lote", "Fecha"}:
+                        diffs.append((k, old_v, new_v_s))
+
+                if hist and diffs:
+                    det = "\n".join(f"• {k}: '{o}' → '{n}'" for k, o, n in diffs[:8])
+                    ok = messagebox.askyesno(
+                        "Remuestreo detectado",
+                        f"Se detectaron cambios para:\n\nProducto: {producto}\nLote: {lote}\n\n{det}\n\n¿Fusionar y actualizar historial?"
+                    )
+                    if not ok:
+                        continue
+
+                for k, new_v in final_values.items():
+                    old_v = str(hist.get(k, "")).strip()
+                    new_v_s = str(new_v).strip()
+                    if old_v != new_v_s and k not in {"Cliente", "Producto", "Lote", "Fecha"}:
+                        cambios += 1
+                        audit_rows.append({
+                            "FechaHora": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                            "Cliente": cliente_actual,
+                            "ProductoOriginal": producto,
+                            "ProductoCanonico": _canonical_product_name(producto),
+                            "Lote": lote,
+                            "Formato": fmt_nombre,
+                            "Parametro": k,
+                            "ValorAnterior": old_v,
+                            "ValorNuevo": new_v_s,
+                            "OrigenPDF": src_files,
+                            "Motivo": "resample_merge",
+                        })
+                save_micro_history_record(cliente_actual, producto, lote, final_values, fmt_nombre)
+
+        if audit_rows:
+            append_micro_audit_rows(audit_rows)
+
+        self._micro_results = nuevos
+        self._micro_formatos = formatos
+        total = sum(1 for p in nuevos.values() for l in p.values() for v in l.values() if v)
+        self.micro_status_label['text'] = f"✔ Gestión micro: {total} campo(s), {cambios} cambio(s) auditado(s)."
+        self.micro_status_label['foreground'] = "green"
+        self._set_step_done(5, True)
+        messagebox.showinfo(
+            "Gestión microbiológica",
+            f"Proceso completado.\nCambios auditados: {cambios}."
+        )
 
     def _validar_antes_generar(self):
         """Chequea que todo esté listo. Devuelve lista de problemas."""
