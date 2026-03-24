@@ -19,6 +19,7 @@ CONFIG_FILE = "config.json"
 MICRO_HISTORY = "Historial_Microbiologia.xlsx"
 COA_REGISTRY = "Registro_COAs.xlsx"
 SESSION_FILE = "session.json"
+MICRO_AUDIT_FILE = "Historial_Microbiologia_Auditoria.xlsx"
 BACKUP_DIRNAME = "_backups"
 
 
@@ -72,6 +73,13 @@ def load_config(config_file=CONFIG_FILE):
         "quality_formats": DEFAULT_QUALITY_FORMATS,
         "client_map": DEFAULT_CLIENT_MAP,
         "brand_map": DEFAULT_BRAND_MAP,
+        "product_alias_map": {},
+        "micro_module": {
+            "missing_value_source": "history_first",
+            "resample_mode": "merge_detected_only",
+            "audit_file": MICRO_AUDIT_FILE,
+            "auto_detect_language": True,
+        },
     }
     if os.path.exists(config_file):
         try:
@@ -90,6 +98,14 @@ def load_config(config_file=CONFIG_FILE):
                     data["client_map"] = DEFAULT_CLIENT_MAP
                 if "brand_map" not in data:
                     data["brand_map"] = DEFAULT_BRAND_MAP
+                if "product_alias_map" not in data:
+                    data["product_alias_map"] = defaults["product_alias_map"]
+                if "micro_module" not in data:
+                    data["micro_module"] = defaults["micro_module"]
+                else:
+                    for mk, mv in defaults["micro_module"].items():
+                        if mk not in data["micro_module"]:
+                            data["micro_module"][mk] = mv
                 return data
         except Exception:
             pass
@@ -212,6 +228,52 @@ def save_micro_history_record(cliente, producto, lote, micro_values, config, for
         wb.save(history_file)
     except Exception as e:
         logging.error(f"Error guardando historial micro: {e}")
+
+
+def append_micro_audit_rows(rows, audit_file=MICRO_AUDIT_FILE):
+    """Guarda auditoría de cambios microbiológicos en archivo separado."""
+    if not rows:
+        return
+    try:
+        import openpyxl
+
+        headers = [
+            "FechaHora",
+            "Cliente",
+            "ProductoOriginal",
+            "ProductoCanonico",
+            "Lote",
+            "Formato",
+            "Parametro",
+            "ValorAnterior",
+            "ValorNuevo",
+            "OrigenPDF",
+            "Motivo",
+        ]
+
+        if os.path.exists(audit_file):
+            wb = openpyxl.load_workbook(audit_file)
+            ws = wb[wb.sheetnames[0]]
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Auditoria"
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = openpyxl.styles.Font(bold=True)
+
+        for row in rows:
+            ws.append([row.get(h, "") for h in headers])
+
+        for col in ws.columns:
+            max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 45)
+
+        _ensure_parent_dir(audit_file)
+        _create_backup(audit_file)
+        wb.save(audit_file)
+    except Exception as e:
+        logging.error(f"Error guardando auditoría micro: {e}")
 
 
 def get_registro_path(base_dir):

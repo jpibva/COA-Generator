@@ -35,6 +35,7 @@ DEFAULT_MICRO_FORMATS = {
         "parametros": [
             {"nombre": "Total Plate Count",             "clave": "TPC",          "defecto": "",         "ingresar": True,  "sinonimos": "total plate count,total plate,ram"},
             {"nombre": "Total Coliforms",               "clave": "Coliforms",    "defecto": "<10",      "ingresar": False, "sinonimos": "total coliforms,coliforms"},
+            {"nombre": "Enterobacteriaceae",            "clave": "Enterobacteria","defecto": "<10",      "ingresar": False, "sinonimos": "enterobacteriaceae,enterobacterias,enterobacteria"},
             {"nombre": "E. coli",                       "clave": "Ecoli",        "defecto": "<10",      "ingresar": False, "sinonimos": "e. coli,e.coli"},
             {"nombre": "Yeast",                         "clave": "Yeast",        "defecto": "",         "ingresar": True,  "sinonimos": "yeast"},
             {"nombre": "Mold",                          "clave": "Mold",         "defecto": "",         "ingresar": True,  "sinonimos": "mold,moulds"},
